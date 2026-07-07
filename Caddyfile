@@ -1,0 +1,17 @@
+# Replace with your actual domain — Caddy gets and renews a real HTTPS
+# certificate for it automatically the first time it starts. This requires
+# a domain's DNS A record pointing at this server's IP address.
+your-domain.com {
+    reverse_proxy api:8000
+}
+
+# --- No domain yet? ---
+# Comment out the block above and uncomment this one instead. It serves
+# plain HTTP on port 80 with no certificate — fine for getting the demo
+# side running quickly, but the Connect tab sends your API secret and PIN
+# in the clear over this, so treat it as temporary and get a domain (even a
+# cheap one) before doing anything with real credentials or live mode.
+#
+# :80 {
+#     reverse_proxy api:8000
+# }

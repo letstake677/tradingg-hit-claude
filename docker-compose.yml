@@ -1,0 +1,65 @@
+# Brings up the whole stack: the trading engine, the API, and Caddy in
+# front of it for automatic HTTPS.
+#
+# First time setup:
+#   1. cp .env.example .env   and fill it in
+#   2. edit the domain in Caddyfile (or see the no-domain option there)
+#   3. docker compose up -d --build
+#   4. docker compose logs -f          # watch both processes start
+
+services:
+  bot:
+    build: ./backend
+    container_name: kehlo-bot
+    command: python3 bot.py
+    env_file: .env
+    environment:
+      - KEHLO_DB_PATH=/data/kehlo_trading.db
+    volumes:
+      - kehlo_data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    build: ./backend
+    container_name: kehlo-api
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      - KEHLO_DB_PATH=/data/kehlo_trading.db
+    volumes:
+      - kehlo_data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Direct access while testing, e.g. http://your-server-ip:8000 — remove
+    # this once Caddy is fronting it if you don't want it reachable
+    # unencrypted on that port too.
+    ports:
+      - "8000:8000"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: kehlo-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  kehlo_data:      # the shared SQLite database (WAL mode — safe for the two containers above)
+  caddy_data:      # Caddy's certificate storage, so renewed certs survive a restart
+  caddy_config:
