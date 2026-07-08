@@ -20,6 +20,7 @@ from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import crypto_utils as cu
@@ -245,3 +246,13 @@ def logs(limit: int = 200, level: Optional[str] = None):
 @app.get("/api/stats")
 def stats():
     return db.get_stats()
+
+
+# ---------------- dashboard (static site) ----------------
+# Mounted LAST and at "/" so every /api/* route above is matched first —
+# anything that isn't an API call falls through to the dashboard's files.
+# If dashboard_dist wasn't built/copied in, the API still works fine on its
+# own; visiting "/" would just 404 as before.
+_dashboard_dir = os.path.join(os.path.dirname(__file__), "dashboard_dist")
+if os.path.isdir(_dashboard_dir):
+    app.mount("/", StaticFiles(directory=_dashboard_dir, html=True), name="dashboard")
