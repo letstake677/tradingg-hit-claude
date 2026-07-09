@@ -23,8 +23,10 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import bot as bot_module
 import crypto_utils as cu
 import database as db
+from bitget_client import BitgetClient, BitgetAPIError
 
 app = FastAPI(title="Kehlo Trading API")
 
@@ -246,6 +248,27 @@ def logs(limit: int = 200, level: Optional[str] = None):
 @app.get("/api/stats")
 def stats():
     return db.get_stats()
+
+
+@app.get("/api/account/balance")
+def account_balance():
+    """
+    Live USDT equity straight from Bitget, for whichever mode bot.py has
+    confirmed is currently active. Builds its own short-lived client rather
+    than reaching into bot.py's running one — in the VPS/Docker-Compose
+    deployment, api.py and bot.py are separate processes and don't share
+    memory, only the database.
+    """
+    demo = db.get_setting("live_mode_active") != "true"
+    try:
+        creds = bot_module.load_credentials_for_mode(demo)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    try:
+        equity = bot_module.get_equity(BitgetClient(creds))
+    except BitgetAPIError as e:
+        return JSONResponse(status_code=502, content={"error": f"Bitget error: {e}"})
+    return {"equity": equity, "mode": "demo" if demo else "live"}
 
 
 # ---------------- dashboard (static site) ----------------
