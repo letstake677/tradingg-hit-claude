@@ -115,19 +115,26 @@ def get_equity(client: BitgetClient) -> float:
 
 
 def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManager, symbol: str):
+    dry_run = db.get_setting("dry_run") == "true"
+
     raw_candles = client.get_candles(symbol, GRANULARITY, product_type=PRODUCT_TYPE, limit=150)
     candles = [Candle.from_bitget_row(row) for row in raw_candles]
     if len(candles) > 1 and candles[0].ts > candles[-1].ts:
         candles.reverse()  # make sure it's oldest-first regardless of API order
 
+    if dry_run:
+        _dry_run_check_fills(symbol, candles)
+
     signal = engine.generate_signal(candles)
     if signal is None:
         return
 
-    equity = get_equity(client)
+    equity = db.get_dry_run_equity() if dry_run else get_equity(client)
     today_pnl_pct = 0.0
     if equity > 0:
-        today_pnl = db.get_realized_pnl_since(_start_of_today_ts())
+        since = _start_of_today_ts()
+        today_pnl = (db.get_dry_run_realized_pnl_since(since) if dry_run
+                     else db.get_realized_pnl_since(since))
         today_pnl_pct = (today_pnl / equity) * 100
 
     already_open_same_symbol = any(t["symbol"] == symbol for t in db.get_open_trades(symbol))
@@ -144,13 +151,30 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
         return
 
     if equity <= 0:
-        _log("warning", f"[{symbol}] could not read account equity, skipping trade")
+        _log("warning", f"[{symbol}] could not read {'dry-run' if dry_run else 'account'} equity, skipping trade")
         return
 
     plan = risk_mgr.build_trade_plan(
         direction=signal.direction, entry=signal.entry, stop_loss=signal.stop_loss,
         take_profits=signal.take_profits, account_equity=equity, tp_reasons=signal.tp_reasons,
     )
+
+    if dry_run:
+        # Signal and risk math are real — only the actual Bitget order calls
+        # are skipped. The trade is recorded exactly like a real one so it
+        # shows up identically on the dashboard, just tagged dry_run=1.
+        trade_id = db.open_trade(
+            symbol=symbol, direction=signal.direction, entry_price=signal.entry,
+            stop_loss=signal.stop_loss, sl_reason=signal.sl_reason, sl_order_id=None,
+            position_size=plan.position_size, confidence=signal.confidence,
+            demo=client.creds.demo, tp_levels=plan.tp_levels, dry_run=True,
+        )
+        tp_summary = " | ".join(f"TP{i+1} {tp.price:.4f} ({tp.reason})" for i, tp in enumerate(plan.tp_levels))
+        _log("info", f"[DRY RUN][{symbol}] simulated trade #{trade_id}: {signal.direction} @ "
+                      f"{signal.entry:.4f} (SL {signal.stop_loss:.4f} — {signal.sl_reason}), "
+                      f"size {plan.position_size:.4f}, confidence {signal.confidence:.2f}. {tp_summary} "
+                      f"— NOT sent to Bitget")
+        return
 
     side = "buy" if signal.direction == "long" else "sell"
     hold_side = "long" if signal.direction == "long" else "short"
@@ -187,6 +211,75 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
                   f"confidence {signal.confidence:.2f}. {tp_summary}")
 
 
+def _dry_run_check_fills(symbol: str, candles: list):
+    """
+    Dry-run only. Checks every simulated open trade on this symbol against
+    the latest candle's high/low to see if a TP or SL level would have been
+    hit — entirely in the database, no Bitget account calls at all. Assumes
+    a perfect fill exactly at the planned price (no slippage), since
+    nothing is actually being executed on an order book.
+    """
+    if not candles:
+        return
+    last = candles[-1]
+
+    for trade in db.get_open_trades(symbol):
+        if not trade.get("dry_run"):
+            continue
+
+        direction = trade["direction"]
+        entry = trade["entry_price"]
+        size = trade["position_size"]
+
+        legs = sorted(trade["tp_legs"], key=lambda l: l["level"])
+        sl_hit = (last.low <= trade["stop_loss"]) if direction == "long" else (last.high >= trade["stop_loss"])
+
+        newly_hit_levels = []
+        for leg in legs:
+            if leg["hit"] == 1:
+                continue
+            tp_reached = (last.high >= leg["price"]) if direction == "long" else (last.low <= leg["price"])
+            if tp_reached:
+                db.mark_tp_hit(trade["id"], leg["level"])
+                leg["hit"] = 1
+                newly_hit_levels.append(leg)
+                _log("info", f"[DRY RUN][{symbol}] trade #{trade['id']} TP{leg['level']} "
+                              f"simulated fill @ {leg['price']:.4f}")
+
+        for leg in newly_hit_levels:
+            if leg["level"] == 1 and not trade["breakeven_applied"]:
+                db.update_trade_sl(trade["id"], new_stop_loss=entry, sl_order_id=None,
+                                    sl_reason="moved to breakeven after TP1 filled (simulated)",
+                                    breakeven_applied=True)
+                trade["stop_loss"] = entry
+                trade["breakeven_applied"] = 1
+                _log("info", f"[DRY RUN][{symbol}] trade #{trade['id']} SL moved to breakeven "
+                              f"({entry:.4f}) after TP1")
+
+        legs = sorted(db.get_open_trades(symbol), key=lambda t: t["id"])
+        legs = next((t["tp_legs"] for t in legs if t["id"] == trade["id"]), legs)
+        all_hit = all(l["hit"] == 1 for l in legs) if legs else False
+
+        if all_hit:
+            pnl = sum(_dry_run_pnl_for_leg(direction, entry, l["price"], size, l["close_fraction"]) for l in legs)
+            db.close_trade(trade["id"], realized_pnl=pnl, close_reason="tp_all_hit")
+            _log("info", f"[DRY RUN][{symbol}] trade #{trade['id']} closed — all TPs hit, pnl {pnl:.4f}")
+        elif sl_hit:
+            hit_fraction = sum(l["close_fraction"] for l in legs if l["hit"] == 1)
+            remaining_fraction = max(0.0, 1.0 - hit_fraction)
+            pnl = sum(_dry_run_pnl_for_leg(direction, entry, l["price"], size, l["close_fraction"])
+                      for l in legs if l["hit"] == 1)
+            pnl += _dry_run_pnl_for_leg(direction, entry, trade["stop_loss"], size, remaining_fraction)
+            reason = "breakeven" if trade["breakeven_applied"] else "sl_hit"
+            db.close_trade(trade["id"], realized_pnl=pnl, close_reason=reason)
+            _log("info", f"[DRY RUN][{symbol}] trade #{trade['id']} closed — {reason}, pnl {pnl:.4f}")
+
+
+def _dry_run_pnl_for_leg(direction: str, entry: float, fill_price: float, size: float, fraction: float) -> float:
+    sign = 1 if direction == "long" else -1
+    return (fill_price - entry) * sign * size * fraction
+
+
 def manage_open_positions(client: BitgetClient):
     """
     For each open trade: compare the live position size to what we recorded
@@ -207,6 +300,9 @@ def manage_open_positions(client: BitgetClient):
     live_by_symbol = {p["symbol"]: p for p in live_positions if float(p.get("total", 0)) > 0}
 
     for trade in db.get_open_trades():
+        if trade.get("dry_run"):
+            continue  # simulated trades are managed entirely by _dry_run_check_fills instead
+
         live = live_by_symbol.get(trade["symbol"])
         if live is None:
             continue  # fully closed — reconcile_open_trades() handles this case
@@ -268,6 +364,9 @@ def reconcile_open_trades(client: BitgetClient):
     live_symbols = {p["symbol"] for p in live_positions if float(p.get("total", 0)) > 0}
 
     for trade in db.get_open_trades():
+        if trade.get("dry_run"):
+            continue  # simulated trades are closed by _dry_run_check_fills instead
+
         if trade["symbol"] in live_symbols:
             continue
 
@@ -357,6 +456,7 @@ def main():
             max_daily_loss_pct=float(settings.get("max_daily_loss_pct", 5.0)),
         )
         symbols = json.loads(settings.get("symbols", '["BTCUSDT"]'))
+        dry_run = settings.get("dry_run", "false") == "true"
 
         for symbol in symbols:
             try:
@@ -366,15 +466,20 @@ def main():
             except Exception:
                 _log("error", f"[{symbol}] unexpected error:\n{traceback.format_exc()}")
 
-        try:
-            manage_open_positions(client)
-        except Exception:
-            _log("error", f"manage_open_positions crashed:\n{traceback.format_exc()}")
+        # In dry run, nothing was ever sent to Bitget, so there's nothing
+        # real to reconcile — skip these entirely rather than making
+        # account calls that would just fail for someone who hasn't sorted
+        # out a working demo/live key yet.
+        if not dry_run:
+            try:
+                manage_open_positions(client)
+            except Exception:
+                _log("error", f"manage_open_positions crashed:\n{traceback.format_exc()}")
 
-        try:
-            reconcile_open_trades(client)
-        except Exception:
-            _log("error", f"reconcile_open_trades crashed:\n{traceback.format_exc()}")
+            try:
+                reconcile_open_trades(client)
+            except Exception:
+                _log("error", f"reconcile_open_trades crashed:\n{traceback.format_exc()}")
 
         time.sleep(POLL_INTERVAL_SECONDS)
 

@@ -95,6 +95,8 @@ class SettingsUpdate(BaseModel):
     max_daily_loss_pct: Optional[float] = None
     symbols: Optional[list] = None
     timeframe: Optional[str] = None
+    dry_run: Optional[bool] = None
+    dry_run_starting_balance: Optional[float] = None
 
 
 class ModeSwitchRequest(BaseModel):
@@ -126,6 +128,8 @@ def get_status():
             "max_daily_loss_pct": float(settings.get("max_daily_loss_pct", 5.0)),
             "symbols": json.loads(settings.get("symbols", "[]")),
             "timeframe": settings.get("timeframe", "15m"),
+            "dry_run": settings.get("dry_run") == "true",
+            "dry_run_starting_balance": float(settings.get("dry_run_starting_balance", 1000.0)),
         },
         "open_position_count": len(db.get_open_trades()),
     }
@@ -155,6 +159,11 @@ def update_settings(update: SettingsUpdate):
         db.set_setting("symbols", json.dumps(update.symbols))
     if update.timeframe is not None:
         db.set_setting("timeframe", update.timeframe)
+    if update.dry_run is not None:
+        db.set_setting("dry_run", "true" if update.dry_run else "false")
+        db.log_event("info", "api", f"Dry run mode {'enabled' if update.dry_run else 'disabled'} via dashboard")
+    if update.dry_run_starting_balance is not None:
+        db.set_setting("dry_run_starting_balance", str(update.dry_run_starting_balance))
     return {"settings": db.get_all_settings()}
 
 
@@ -257,8 +266,12 @@ def account_balance():
     confirmed is currently active. Builds its own short-lived client rather
     than reaching into bot.py's running one — in the VPS/Docker-Compose
     deployment, api.py and bot.py are separate processes and don't share
-    memory, only the database.
+    memory, only the database. In dry run, returns the simulated equity
+    instead — there's no real Bitget balance to check against.
     """
+    if db.get_setting("dry_run") == "true":
+        return {"equity": db.get_dry_run_equity(), "mode": "dry_run"}
+
     demo = db.get_setting("live_mode_active") != "true"
     try:
         creds = bot_module.load_credentials_for_mode(demo)

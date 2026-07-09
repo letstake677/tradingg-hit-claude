@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS trades (
     sl_reason TEXT,                        -- why the stop sits exactly there
     sl_order_id TEXT,                      -- Bitget's plan order id for the current SL leg
     breakeven_applied INTEGER NOT NULL DEFAULT 0,  -- guards against re-moving the SL every tick
+    dry_run INTEGER NOT NULL DEFAULT 0,             -- simulated trade, never sent to Bitget at all
     position_size REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',   -- open | closed
     opened_at INTEGER NOT NULL,
@@ -93,6 +94,8 @@ DEFAULT_SETTINGS = {
     "symbols": json.dumps(["BTCUSDT", "ETHUSDT"]),
     "timeframe": "15m",
     "live_mode_requested": "false",
+    "dry_run": "false",
+    "dry_run_starting_balance": "1000.0",
 }
 
 
@@ -209,13 +212,13 @@ def get_recent_logs(limit: int = 200, level: Optional[str] = None) -> list:
 
 def open_trade(symbol: str, direction: str, entry_price: float, stop_loss: float,
                 position_size: float, confidence: float, demo: bool, tp_levels: list,
-                sl_reason: str = "", sl_order_id: Optional[str] = None) -> int:
+                sl_reason: str = "", sl_order_id: Optional[str] = None, dry_run: bool = False) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO trades (symbol, direction, entry_price, stop_loss, sl_reason, sl_order_id, "
-            "position_size, opened_at, confidence, demo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "position_size, opened_at, confidence, demo, dry_run) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (symbol, direction, entry_price, stop_loss, sl_reason, sl_order_id, position_size,
-             int(time.time()), confidence, int(demo)),
+             int(time.time()), confidence, int(demo), int(dry_run)),
         )
         trade_id = cur.lastrowid
         for i, tp in enumerate(tp_levels, start=1):
@@ -225,6 +228,28 @@ def open_trade(symbol: str, direction: str, entry_price: float, stop_loss: float
                 (trade_id, i, tp.price, tp.close_fraction, tp.reason),
             )
         return trade_id
+
+
+def get_dry_run_equity() -> float:
+    """Starting balance + all realized PnL from dry-run (simulated) trades
+    only — kept completely separate from anything touching a real Bitget
+    balance."""
+    starting = float(get_setting("dry_run_starting_balance") or 1000.0)
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT SUM(realized_pnl) as pnl FROM trades WHERE dry_run = 1 AND status = 'closed'"
+        ).fetchone()
+        return starting + (row["pnl"] or 0.0)
+
+
+def get_dry_run_realized_pnl_since(since_ts: int) -> float:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT SUM(realized_pnl) as pnl FROM trades WHERE dry_run = 1 AND status = 'closed' "
+            "AND closed_at >= ?",
+            (since_ts,),
+        ).fetchone()
+        return row["pnl"] or 0.0
 
 
 def set_tp_leg_order_id(trade_id: int, level: int, order_id: str):
