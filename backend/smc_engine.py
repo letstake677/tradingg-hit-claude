@@ -84,6 +84,7 @@ class Signal:
     sl_reason: str  # why the stop sits exactly there — never just "a small % away"
     take_profits: list
     tp_reasons: list  # what each TP level actually targets — check this before trusting a TP
+    has_real_tp_structure: bool  # False = every TP is a raw R-multiple guess, not a real level
     confidence: float  # 0-1 rough score based on how many confluences lined up
     reasons: list = field(default_factory=list)
 
@@ -419,7 +420,8 @@ class SMCEngine:
         take_profits = [p for p, _ in ordered]
         tp_reasons = [r for _, r in ordered]
 
-        if any("fallback" not in r for r in tp_reasons):
+        has_real_tp_structure = any("fallback" not in r for r in tp_reasons)
+        if has_real_tp_structure:
             confidence += 0.1
             reasons.append("At least one TP targets real structure, not just an R-multiple")
 
@@ -430,6 +432,7 @@ class SMCEngine:
             sl_reason=sl_reason,
             take_profits=take_profits,
             tp_reasons=tp_reasons,
+            has_real_tp_structure=has_real_tp_structure,
             confidence=min(confidence, 1.0),
             reasons=reasons,
         )

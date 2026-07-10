@@ -142,10 +142,16 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
         open_position_count=len(db.get_open_trades()),
         today_realised_pnl_pct=today_pnl_pct,
     )
-    taken = can_open and not already_open_same_symbol
+    # A structural SL alone isn't "educated" enough — if every TP fell back to
+    # a raw R-multiple, there's no real target to trade toward, just a guess
+    # on the reward side. Skip it rather than betting on made-up levels.
+    taken = can_open and not already_open_same_symbol and signal.has_real_tp_structure
     db.log_signal(symbol, signal, taken=taken)
     if not taken:
-        if not can_open and today_pnl_pct <= -abs(risk_mgr.max_daily_loss_pct):
+        if not signal.has_real_tp_structure:
+            _log("info", f"[{symbol}] signal skipped — no real TP structure found (every "
+                          f"target was a raw R-multiple guess), not a real setup to trade")
+        elif not can_open and today_pnl_pct <= -abs(risk_mgr.max_daily_loss_pct):
             _log("warning", f"[{symbol}] signal skipped — daily loss circuit breaker tripped "
                              f"({today_pnl_pct:.2f}% today)")
         return
