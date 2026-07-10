@@ -286,6 +286,27 @@ def _dry_run_pnl_for_leg(direction: str, entry: float, fill_price: float, size: 
     return (fill_price - entry) * sign * size * fraction
 
 
+def dry_run_unrealized_pnl(trade: dict, current_price: float) -> float:
+    """
+    Mark-to-market snapshot of a still-open dry-run trade: locked-in PnL
+    from any TP legs already hit, plus floating PnL on whatever fraction
+    remains open, valued at current_price. Used by the dashboard's Account
+    Balance so it moves with the market instead of sitting frozen until a
+    trade fully closes.
+    """
+    direction = trade["direction"]
+    entry = trade["entry_price"]
+    size = trade["position_size"]
+    legs = trade.get("tp_legs", [])
+    hit_fraction = sum(l["close_fraction"] for l in legs if l["hit"] == 1)
+    remaining_fraction = max(0.0, 1.0 - hit_fraction)
+
+    pnl = sum(_dry_run_pnl_for_leg(direction, entry, l["price"], size, l["close_fraction"])
+              for l in legs if l["hit"] == 1)
+    pnl += _dry_run_pnl_for_leg(direction, entry, current_price, size, remaining_fraction)
+    return pnl
+
+
 def manage_open_positions(client: BitgetClient):
     """
     For each open trade: compare the live position size to what we recorded
@@ -412,6 +433,13 @@ def main():
     db.init_db()
     engine = SMCEngine(swing_lookback=3)
 
+    # Symbols Bitget has told us don't exist (e.g. a delisted/renamed pair
+    # like the MATIC->POL rename) — tracked per process run so we stop
+    # retrying and re-logging the same permanent error every 60s. A code
+    # change or settings fix (correcting the symbol name) plus a restart
+    # clears this, since it's just in-memory, not persisted.
+    invalid_symbols = set()
+
     state = {"client": None, "demo": True}
 
     def switch_to(demo: bool):
@@ -479,10 +507,18 @@ def main():
         dry_run = settings.get("dry_run", "false") == "true"
 
         for symbol in symbols:
+            if symbol in invalid_symbols:
+                continue  # already confirmed invalid this run — don't keep hammering it
             try:
                 process_symbol(client, engine, risk_mgr, symbol)
             except BitgetAPIError as e:
-                _log("error", f"[{symbol}] Bitget API error: {e}")
+                if "does not exist" in str(e) or "40034" in str(e):
+                    invalid_symbols.add(symbol)
+                    _log("error", f"[{symbol}] Bitget says this symbol doesn't exist — skipping it "
+                                   f"for the rest of this run. Check for a rename (e.g. MATICUSDT is "
+                                   f"now POLUSDT) or remove it from Settings. ({e})")
+                else:
+                    _log("error", f"[{symbol}] Bitget API error: {e}")
             except Exception:
                 _log("error", f"[{symbol}] unexpected error:\n{traceback.format_exc()}")
 

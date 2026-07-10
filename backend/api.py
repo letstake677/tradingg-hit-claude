@@ -266,11 +266,36 @@ def account_balance():
     confirmed is currently active. Builds its own short-lived client rather
     than reaching into bot.py's running one — in the VPS/Docker-Compose
     deployment, api.py and bot.py are separate processes and don't share
-    memory, only the database. In dry run, returns the simulated equity
-    instead — there's no real Bitget balance to check against.
+    memory, only the database. In dry run, returns realized PnL from
+    closed trades PLUS mark-to-market unrealized PnL from any still-open
+    simulated positions, so the number actually moves with the market
+    instead of sitting frozen until a trade fully closes.
     """
     if db.get_setting("dry_run") == "true":
-        return {"equity": db.get_dry_run_equity(), "mode": "dry_run"}
+        realized_equity = db.get_dry_run_equity()
+        open_dry_trades = [t for t in db.get_open_trades() if t.get("dry_run")]
+        unrealized_total = 0.0
+        if open_dry_trades:
+            try:
+                demo = db.get_setting("live_mode_active") != "true"
+                creds = bot_module.load_credentials_for_mode(demo)
+                client = BitgetClient(creds)
+                product_type = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
+                price_cache = {}
+                for trade in open_dry_trades:
+                    symbol = trade["symbol"]
+                    if symbol not in price_cache:
+                        raw = client.get_candles(symbol, "1m", product_type=product_type, limit=1)
+                        price_cache[symbol] = float(raw[-1][4])  # close of the latest candle
+                    unrealized_total += bot_module.dry_run_unrealized_pnl(trade, price_cache[symbol])
+            except Exception as e:
+                # Price fetch failing shouldn't take down the whole balance
+                # display — just fall back to realized-only and say so.
+                return {"equity": realized_equity, "mode": "dry_run",
+                        "unrealized_pnl": None,
+                        "note": f"showing realized only — couldn't fetch live prices ({e})"}
+        return {"equity": realized_equity + unrealized_total, "mode": "dry_run",
+                "unrealized_pnl": unrealized_total}
 
     demo = db.get_setting("live_mode_active") != "true"
     try:
