@@ -421,8 +421,22 @@ def main():
     try:
         switch_to(demo=True)
     except ValueError as e:
-        _log("error", f"Cannot start: {e}")
-        raise
+        if db.get_setting("dry_run") == "true":
+            # Dry run never touches account endpoints (positions, orders,
+            # balance) — only public candle data, which may work even
+            # without a correctly-matched demo/live key. Don't crash the
+            # whole loop over this; let get_candles() fail per-symbol
+            # instead if it truly can't authenticate at all.
+            _log("warning", f"No working demo/live credentials yet ({e}). Continuing in "
+                             f"DRY RUN anyway — candle fetches may still fail per-symbol "
+                             f"until ANY valid Bitget key is attached (even a live-labeled "
+                             f"one is fine for dry run, since only public market data is used).")
+            state["client"] = BitgetClient(BitgetCredentials(api_key="", api_secret="",
+                                                              passphrase="", demo=True))
+            state["demo"] = True
+        else:
+            _log("error", f"Cannot start: {e}")
+            raise
     _log("info", "Bot process started")
 
     last_mode_check = 0.0
