@@ -230,7 +230,95 @@ def credentials_status():
 
 @app.get("/api/trades/open")
 def open_trades():
-    return db.get_open_trades()
+    trades = db.get_open_trades()
+    if not trades:
+        return trades
+
+    price_cache = {}
+    try:
+        demo = db.get_setting("live_mode_active") != "true"
+        creds = bot_module.load_credentials_for_mode(demo)
+        client = BitgetClient(creds)
+        product_type = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
+        for trade in trades:
+            symbol = trade["symbol"]
+            if symbol not in price_cache:
+                try:
+                    raw = client.get_candles(symbol, "1m", product_type=product_type, limit=1)
+                    price_cache[symbol] = float(raw[-1][4])
+                except BitgetAPIError:
+                    price_cache[symbol] = None
+            trade["current_price"] = price_cache[symbol]
+    except ValueError:
+        # No credentials configured at all — still return the trades, just
+        # without live prices, rather than failing the whole request.
+        for trade in trades:
+            trade["current_price"] = None
+    return trades
+
+
+@app.post("/api/trades/{trade_id}/close")
+def close_trade_manually(trade_id: int):
+    """
+    Manual close from the dashboard. Dry-run trades close immediately at
+    the current market price. Real trades: cancel any pending SL/TP plan
+    orders first (so they can't fire after the position is gone), then
+    close the position on Bitget — the trade stays 'open' in our db until
+    bot.py's next reconcile_open_trades() pass picks up the real PnL from
+    Bitget's history within ~a minute, rather than guessing it here.
+    """
+    trade = next((t for t in db.get_open_trades() if t["id"] == trade_id), None)
+    if not trade:
+        return JSONResponse(status_code=404, content={"error": "Trade not found or already closed"})
+
+    product_type = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
+
+    if trade.get("dry_run"):
+        try:
+            demo = db.get_setting("live_mode_active") != "true"
+            creds = bot_module.load_credentials_for_mode(demo)
+            client = BitgetClient(creds)
+            raw = client.get_candles(trade["symbol"], "1m", product_type=product_type, limit=1)
+            current_price = float(raw[-1][4])
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": f"Couldn't fetch current price to close: {e}"})
+        pnl = bot_module.dry_run_unrealized_pnl(trade, current_price)
+        db.close_trade(trade_id, realized_pnl=pnl, close_reason="manual")
+        db.log_event("info", "api", f"[DRY RUN][{trade['symbol']}] trade #{trade_id} manually closed "
+                                     f"@ ~{current_price:.4f}, pnl {pnl:.4f}")
+        return {"closed": True, "trade_id": trade_id, "pnl": round(pnl, 4), "close_price": current_price}
+
+    try:
+        creds = bot_module.load_credentials_for_mode(bool(trade["demo"]))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    client = BitgetClient(creds)
+    hold_side = "long" if trade["direction"] == "long" else "short"
+
+    warnings = []
+    if trade.get("sl_order_id"):
+        try:
+            client.cancel_tpsl_order(trade["symbol"], trade["sl_order_id"], product_type=product_type)
+        except BitgetAPIError as e:
+            warnings.append(f"cancel SL order: {e}")
+    for leg in trade.get("tp_legs", []):
+        if leg.get("bitget_order_id") and leg["hit"] != 1:
+            try:
+                client.cancel_tpsl_order(trade["symbol"], leg["bitget_order_id"], product_type=product_type)
+            except BitgetAPIError as e:
+                warnings.append(f"cancel TP{leg['level']} order: {e}")
+
+    try:
+        client.close_position(trade["symbol"], product_type=product_type, hold_side=hold_side)
+    except BitgetAPIError as e:
+        return JSONResponse(status_code=502, content={"error": f"Failed to close position on Bitget: {e}",
+                                                        "warnings": warnings})
+
+    db.log_event("info", "api", f"[{trade['symbol']}] trade #{trade_id} manual close sent to Bitget via "
+                                 f"dashboard — real PnL will show once reconciliation confirms it")
+    return {"closed": "pending", "trade_id": trade_id, "warnings": warnings,
+            "note": "Close request sent to Bitget. This will show as closed with real PnL once bot.py's "
+                    "next reconciliation pass confirms it (within about a minute)."}
 
 
 @app.get("/api/trades/history")
