@@ -34,6 +34,7 @@ once during your first demo run and adjust if Bitget shapes them differently.
 """
 
 import json
+import math
 import os
 import time
 import traceback
@@ -46,6 +47,28 @@ from smc_engine import Candle, SMCEngine
 from risk_manager import RiskManager
 import database as db
 import crypto_utils as cu
+
+# Per-symbol size/price precision, cached for the life of the process —
+# these rarely change and re-fetching on every trade would be wasteful.
+# Fixes error 40808 ("Parameter verification exception... checkBDScale"):
+# every symbol has a DIFFERENT required number of decimal places for size
+# (e.g. BTCUSDT wants 2, DOGEUSDT wants 0), and a flat f"{x:.6f}" was
+# sending the wrong precision for most symbols.
+_contract_config_cache = {}
+
+
+def _get_contract_config(client: BitgetClient, symbol: str, product_type: str) -> dict:
+    key = (symbol, product_type)
+    if key not in _contract_config_cache:
+        _contract_config_cache[key] = client.get_contract_config(symbol, product_type=product_type.lower())
+    return _contract_config_cache[key]
+
+
+def _round_size(size: float, volume_place: int) -> float:
+    """Floors (never rounds up) to the symbol's required decimal places —
+    rounding up could push an order slightly over the intended risk."""
+    factor = 10 ** int(volume_place)
+    return math.floor(size * factor) / factor
 
 load_dotenv()
 
@@ -182,29 +205,72 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
                       f"— NOT sent to Bitget")
         return
 
+    try:
+        config = _get_contract_config(client, symbol, PRODUCT_TYPE)
+        volume_place = int(config.get("volumePlace", 6))
+        min_trade_num = float(config.get("minTradeNum", 0) or 0)
+        min_trade_usdt = float(config.get("minTradeUSDT", 0) or 0)
+    except BitgetAPIError as e:
+        _log("error", f"[{symbol}] could not fetch contract precision, skipping trade: {e}")
+        return
+
+    rounded_size = _round_size(plan.position_size, volume_place)
+    notional = rounded_size * signal.entry
+    if rounded_size <= 0 or rounded_size < min_trade_num or (min_trade_usdt and notional < min_trade_usdt):
+        _log("warning", f"[{symbol}] computed size {plan.position_size:.6f} rounds to "
+                         f"{rounded_size} (precision {volume_place}dp) — below this symbol's minimum "
+                         f"tradeable size (min qty {min_trade_num}, min notional ${min_trade_usdt}). "
+                         f"Account may be too small for this symbol at the current risk_per_trade_pct — "
+                         f"skipping rather than sending an order Bitget will reject.")
+        return
+
     side = "buy" if signal.direction == "long" else "sell"
     hold_side = "long" if signal.direction == "long" else "short"
-    size_str = f"{plan.position_size:.6f}"
+    size_str = f"{rounded_size:.{volume_place}f}"
 
-    client.place_order(symbol=symbol, side=side, trade_side="open", order_type="market",
-                        size=size_str, product_type=PRODUCT_TYPE)
+    try:
+        client.place_order(symbol=symbol, side=side, trade_side="open", order_type="market",
+                            size=size_str, product_type=PRODUCT_TYPE)
 
-    sl_result = client.place_tpsl_leg(symbol=symbol, plan_type="loss_plan",
-                                       trigger_price=f"{plan.stop_loss:.6f}", hold_side=hold_side,
-                                       size=size_str, product_type=PRODUCT_TYPE.lower())
-    sl_order_id = sl_result.get("orderId") if isinstance(sl_result, dict) else None
+        sl_result = client.place_tpsl_leg(symbol=symbol, plan_type="loss_plan",
+                                           trigger_price=f"{plan.stop_loss:.6f}", hold_side=hold_side,
+                                           size=size_str, product_type=PRODUCT_TYPE.lower())
+        sl_order_id = sl_result.get("orderId") if isinstance(sl_result, dict) else None
 
-    tp_order_ids = []
-    for tp in plan.tp_levels:
-        leg_size = f"{plan.position_size * tp.close_fraction:.6f}"
-        tp_result = client.place_tpsl_leg(symbol=symbol, plan_type="profit_plan", trigger_price=f"{tp.price:.6f}",
-                                           hold_side=hold_side, size=leg_size, product_type=PRODUCT_TYPE.lower())
-        tp_order_ids.append(tp_result.get("orderId") if isinstance(tp_result, dict) else None)
+        # Round each TP leg to the same precision, but let the LAST leg
+        # absorb whatever rounding remainder is left so all legs sum
+        # exactly to rounded_size — otherwise independently-rounded
+        # fractions can leave a sliver of the position uncovered by any
+        # TP/SL order.
+        tp_order_ids = []
+        remaining = rounded_size
+        for i, tp in enumerate(plan.tp_levels):
+            if i == len(plan.tp_levels) - 1:
+                leg_size = remaining
+            else:
+                leg_size = _round_size(rounded_size * tp.close_fraction, volume_place)
+                remaining -= leg_size
+            leg_size = max(leg_size, 0.0)
+            leg_size_str = f"{leg_size:.{volume_place}f}"
+            tp_result = client.place_tpsl_leg(symbol=symbol, plan_type="profit_plan",
+                                               trigger_price=f"{tp.price:.6f}", hold_side=hold_side,
+                                               size=leg_size_str, product_type=PRODUCT_TYPE.lower())
+            tp_order_ids.append(tp_result.get("orderId") if isinstance(tp_result, dict) else None)
+    except BitgetAPIError as e:
+        if "40762" in str(e) or "exceeds the balance" in str(e):
+            _log("error", f"[{symbol}] order rejected — required margin exceeds available balance. "
+                           f"This can happen if leverage on Bitget is set low relative to position "
+                           f"size, or several symbols competed for the same balance in one cycle "
+                           f"before it updated. Check/raise leverage for {symbol} on Bitget directly, "
+                           f"or lower risk_per_trade_pct / max_concurrent_positions. ({e})")
+        else:
+            _log("error", f"[{symbol}] order placement failed: {e}")
+        return
 
     trade_id = db.open_trade(
         symbol=symbol, direction=signal.direction, entry_price=signal.entry,
         stop_loss=signal.stop_loss, sl_reason=signal.sl_reason, sl_order_id=sl_order_id,
-        position_size=plan.position_size,
+        position_size=rounded_size,
         confidence=signal.confidence, demo=client.creds.demo, tp_levels=plan.tp_levels,
     )
     for level, order_id in enumerate(tp_order_ids, start=1):
@@ -358,10 +424,16 @@ def manage_open_positions(client: BitgetClient):
             try:
                 if trade.get("sl_order_id"):
                     client.cancel_tpsl_order(trade["symbol"], trade["sl_order_id"], product_type=PRODUCT_TYPE)
+                try:
+                    config = _get_contract_config(client, trade["symbol"], PRODUCT_TYPE)
+                    volume_place = int(config.get("volumePlace", 6))
+                except BitgetAPIError:
+                    volume_place = 6  # best-effort fallback — better than crashing this pass
+                sized_remaining = _round_size(live_size, volume_place)
                 new_sl = client.place_tpsl_leg(
                     symbol=trade["symbol"], plan_type="loss_plan",
                     trigger_price=f"{trade['entry_price']:.6f}", hold_side=hold_side,
-                    size=f"{live_size:.6f}", product_type=PRODUCT_TYPE.lower(),
+                    size=f"{sized_remaining:.{volume_place}f}", product_type=PRODUCT_TYPE.lower(),
                 )
                 new_sl_order_id = new_sl.get("orderId") if isinstance(new_sl, dict) else None
                 db.update_trade_sl(trade["id"], new_stop_loss=trade["entry_price"],

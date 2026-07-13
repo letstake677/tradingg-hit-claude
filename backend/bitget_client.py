@@ -129,6 +129,22 @@ class BitgetClient:
             "limit": limit,
         })
 
+    def get_contract_config(self, symbol: str, product_type: str = "usdt-futures") -> dict:
+        """
+        Per-symbol precision and limits — volumePlace (decimal places the
+        size/quantity must be rounded to), pricePlace, sizeMultiplier (the
+        actual step increment), minTradeNum. Every symbol has DIFFERENT
+        precision (e.g. BTCUSDT wants 2 decimals, DOGEUSDT wants 0) —
+        sending a size with the wrong number of decimals is rejected with
+        error 40808. Public data, cache this per symbol rather than
+        fetching on every order.
+        """
+        data = self._request("GET", "/api/v2/mix/market/contracts",
+                              params={"symbol": symbol, "productType": product_type})
+        if isinstance(data, list) and data:
+            return data[0]
+        raise BitgetAPIError("NO_CONTRACT_CONFIG", f"No contract config returned for {symbol}")
+
     def get_history_candles(self, symbol: str, granularity: str,
                              product_type: str = "usdt-futures", limit: int = 200) -> list:
         """Deeper history than get_candles — useful for backtesting."""
@@ -226,3 +242,31 @@ class BitgetClient:
         if hold_side:
             body["holdSide"] = hold_side
         return self._request("POST", "/api/v2/mix/order/close-positions", body=body)
+
+    def cancel_tpsl_order(self, symbol: str, order_id: str, product_type: str = "USDT-FUTURES",
+                           margin_coin: str = "USDT") -> dict:
+        """Cancels a single plan/TP-SL order — used to pull the old SL before
+        placing a fresh one at breakeven."""
+        body = {
+            "symbol": symbol,
+            "productType": product_type,
+            "marginCoin": margin_coin,
+            "orderIdList": [{"orderId": order_id}],
+        }
+        return self._request("POST", "/api/v2/mix/order/cancel-plan-order", body=body)
+
+    def get_history_positions(self, symbol: Optional[str] = None, product_type: str = "USDT-FUTURES",
+                               limit: int = 20) -> list:
+        """
+        Closed-position records with the ACTUAL realised PnL (`netProfit`,
+        net of fees/funding) — order placement responses don't carry this,
+        so this is the only accurate source for what a closed trade really
+        made or lost.
+        """
+        params = {"productType": product_type, "limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        data = self._request("GET", "/api/v2/mix/position/history-position", params=params)
+        if isinstance(data, dict):
+            return data.get("list", [])
+        return data or []

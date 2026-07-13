@@ -292,14 +292,19 @@ def close_trade(trade_id: int, realized_pnl: float, close_reason: str):
         )
 
 
-def get_open_trades(symbol: Optional[str] = None) -> list:
+def get_open_trades(symbol: Optional[str] = None, dry_run: Optional[bool] = None) -> list:
     with get_conn() as conn:
+        conditions = ["status = 'open'"]
+        params = []
         if symbol:
-            rows = conn.execute(
-                "SELECT * FROM trades WHERE status = 'open' AND symbol = ?", (symbol,)
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM trades WHERE status = 'open'").fetchall()
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if dry_run is not None:
+            conditions.append("dry_run = ?")
+            params.append(int(dry_run))
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE " + " AND ".join(conditions), params
+        ).fetchall()
         trades = [dict(r) for r in rows]
         for t in trades:
             with get_conn() as c2:
@@ -310,22 +315,37 @@ def get_open_trades(symbol: Optional[str] = None) -> list:
         return trades
 
 
-def get_trade_history(limit: int = 100) -> list:
+def get_trade_history(limit: int = 100, dry_run: Optional[bool] = None) -> list:
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if dry_run is not None:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE status = 'closed' AND dry_run = ? "
+                "ORDER BY closed_at DESC LIMIT ?",
+                (int(dry_run), limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_stats() -> dict:
+def get_stats(dry_run: Optional[bool] = None) -> dict:
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) as n, SUM(realized_pnl) as total_pnl, "
-            "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins "
-            "FROM trades WHERE status = 'closed'"
-        ).fetchone()
+        if dry_run is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) as n, SUM(realized_pnl) as total_pnl, "
+                "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins "
+                "FROM trades WHERE status = 'closed' AND dry_run = ?",
+                (int(dry_run),),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) as n, SUM(realized_pnl) as total_pnl, "
+                "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins "
+                "FROM trades WHERE status = 'closed'"
+            ).fetchone()
         n = row["n"] or 0
         wins = row["wins"] or 0
         return {

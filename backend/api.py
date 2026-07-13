@@ -131,7 +131,7 @@ def get_status():
             "dry_run": settings.get("dry_run") == "true",
             "dry_run_starting_balance": float(settings.get("dry_run_starting_balance", 1000.0)),
         },
-        "open_position_count": len(db.get_open_trades()),
+        "open_position_count": len(db.get_open_trades(dry_run=settings.get("dry_run") == "true")),
     }
 
 
@@ -189,6 +189,12 @@ def set_mode(req: ModeSwitchRequest):
                 "error": "Live credentials aren't attached yet — add them via /api/credentials first."
             })
         db.log_event("warning", "api", "Live mode requested via dashboard (PIN verified)")
+        # Going live should mean real trading actually happens — dry_run
+        # silently staying on was confusing (bot only ever simulated,
+        # never placed a real order, with no clear indication why).
+        if db.get_setting("dry_run") == "true":
+            db.set_setting("dry_run", "false")
+            db.log_event("info", "api", "Dry run auto-disabled — you just confirmed going live")
     else:
         db.log_event("info", "api", "Demo mode requested via dashboard")
 
@@ -230,7 +236,8 @@ def credentials_status():
 
 @app.get("/api/trades/open")
 def open_trades():
-    trades = db.get_open_trades()
+    is_dry_run = db.get_setting("dry_run") == "true"
+    trades = db.get_open_trades(dry_run=is_dry_run)
     if not trades:
         return trades
 
@@ -323,7 +330,8 @@ def close_trade_manually(trade_id: int):
 
 @app.get("/api/trades/history")
 def trade_history(limit: int = 100):
-    return db.get_trade_history(limit=limit)
+    is_dry_run = db.get_setting("dry_run") == "true"
+    return db.get_trade_history(limit=limit, dry_run=is_dry_run)
 
 
 # ---------------- signals ----------------
@@ -344,7 +352,8 @@ def logs(limit: int = 200, level: Optional[str] = None):
 
 @app.get("/api/stats")
 def stats():
-    return db.get_stats()
+    is_dry_run = db.get_setting("dry_run") == "true"
+    return db.get_stats(dry_run=is_dry_run)
 
 
 @app.get("/api/account/balance")
