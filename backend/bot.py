@@ -239,32 +239,9 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
     try:
         client.place_order(symbol=symbol, side=side, trade_side="open", order_type="market",
                             size=size_str, product_type=PRODUCT_TYPE)
-
-        sl_result = client.place_tpsl_leg(symbol=symbol, plan_type="loss_plan",
-                                           trigger_price=f"{plan.stop_loss:.6f}", hold_side=hold_side,
-                                           size=size_str, product_type=PRODUCT_TYPE.lower())
-        sl_order_id = sl_result.get("orderId") if isinstance(sl_result, dict) else None
-
-        # Round each TP leg to the same precision, but let the LAST leg
-        # absorb whatever rounding remainder is left so all legs sum
-        # exactly to rounded_size — otherwise independently-rounded
-        # fractions can leave a sliver of the position uncovered by any
-        # TP/SL order.
-        tp_order_ids = []
-        remaining = rounded_size
-        for i, tp in enumerate(plan.tp_levels):
-            if i == len(plan.tp_levels) - 1:
-                leg_size = remaining
-            else:
-                leg_size = _round_size(rounded_size * tp.close_fraction, volume_place)
-                remaining -= leg_size
-            leg_size = max(leg_size, 0.0)
-            leg_size_str = f"{leg_size:.{volume_place}f}"
-            tp_result = client.place_tpsl_leg(symbol=symbol, plan_type="profit_plan",
-                                               trigger_price=f"{tp.price:.6f}", hold_side=hold_side,
-                                               size=leg_size_str, product_type=PRODUCT_TYPE.lower())
-            tp_order_ids.append(tp_result.get("orderId") if isinstance(tp_result, dict) else None)
     except BitgetAPIError as e:
+        # Entry itself never went through — nothing happened on Bitget,
+        # safe to just log and return without touching the database.
         if "40762" in str(e) or "exceeds the balance" in str(e):
             _log("error", f"[{symbol}] order rejected — required margin exceeds available balance. "
                            f"This can happen if leverage on Bitget is set low relative to position "
@@ -272,23 +249,62 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
                            f"before it updated. Check/raise leverage for {symbol} on Bitget directly, "
                            f"or lower risk_per_trade_pct / max_concurrent_positions. ({e})")
         else:
-            _log("error", f"[{symbol}] order placement failed: {e}")
+            _log("error", f"[{symbol}] entry order failed: {e}")
         return
 
+    # The entry is now LIVE on Bitget — record it immediately, before
+    # attempting SL/TP, so a real position can never end up invisible to
+    # our own tracking (dashboard, breakeven automation, position counts)
+    # just because a later step below fails. If SL/TP placement below
+    # fails, that's logged loudly as its own problem — but the trade
+    # itself is never lost track of.
     trade_id = db.open_trade(
         symbol=symbol, direction=signal.direction, entry_price=signal.entry,
-        stop_loss=signal.stop_loss, sl_reason=signal.sl_reason, sl_order_id=sl_order_id,
-        position_size=rounded_size,
-        confidence=signal.confidence, demo=client.creds.demo, tp_levels=plan.tp_levels,
+        stop_loss=signal.stop_loss, sl_reason=signal.sl_reason, sl_order_id=None,
+        position_size=rounded_size, confidence=signal.confidence,
+        demo=client.creds.demo, tp_levels=plan.tp_levels,
     )
-    for level, order_id in enumerate(tp_order_ids, start=1):
-        if order_id:
-            db.set_tp_leg_order_id(trade_id, level, order_id)
+    _log("info", f"[{symbol}] entry filled — trade #{trade_id} recorded ({signal.direction} @ "
+                  f"{signal.entry:.4f}, size {rounded_size}). Placing SL/TP now.")
+
+    try:
+        sl_result = client.place_tpsl_leg(symbol=symbol, plan_type="loss_plan",
+                                           trigger_price=f"{plan.stop_loss:.6f}", hold_side=hold_side,
+                                           size=size_str, product_type=PRODUCT_TYPE.lower())
+        sl_order_id = sl_result.get("orderId") if isinstance(sl_result, dict) else None
+        db.update_trade_sl(trade_id, new_stop_loss=plan.stop_loss, sl_order_id=sl_order_id)
+    except BitgetAPIError as e:
+        _log("error", f"[{symbol}] trade #{trade_id}: entry filled but the STOP-LOSS FAILED TO "
+                       f"PLACE ({e}) — this position currently has NO PROTECTIVE STOP on Bitget. "
+                       f"Check it manually and set one now if this isn't resolved quickly.")
+
+    # Round each TP leg to the same precision, but let the LAST leg absorb
+    # whatever rounding remainder is left so all legs sum exactly to
+    # rounded_size — otherwise independently-rounded fractions can leave a
+    # sliver of the position uncovered by any TP/SL order.
+    remaining = rounded_size
+    for i, tp in enumerate(plan.tp_levels):
+        if i == len(plan.tp_levels) - 1:
+            leg_size = remaining
+        else:
+            leg_size = _round_size(rounded_size * tp.close_fraction, volume_place)
+            remaining -= leg_size
+        leg_size = max(leg_size, 0.0)
+        leg_size_str = f"{leg_size:.{volume_place}f}"
+        try:
+            tp_result = client.place_tpsl_leg(symbol=symbol, plan_type="profit_plan",
+                                               trigger_price=f"{tp.price:.6f}", hold_side=hold_side,
+                                               size=leg_size_str, product_type=PRODUCT_TYPE.lower())
+            order_id = tp_result.get("orderId") if isinstance(tp_result, dict) else None
+            if order_id:
+                db.set_tp_leg_order_id(trade_id, i + 1, order_id)
+        except BitgetAPIError as e:
+            _log("error", f"[{symbol}] trade #{trade_id}: TP{i+1} failed to place ({e}) — that "
+                           f"target won't fire on Bitget; the others are unaffected.")
 
     tp_summary = " | ".join(f"TP{i+1} {tp.price:.4f} ({tp.reason})" for i, tp in enumerate(plan.tp_levels))
-    _log("info", f"[{symbol}] opened trade #{trade_id}: {signal.direction} @ {signal.entry:.4f} "
-                  f"(SL {signal.stop_loss:.4f} — {signal.sl_reason}), size {plan.position_size:.4f}, "
-                  f"confidence {signal.confidence:.2f}. {tp_summary}")
+    _log("info", f"[{symbol}] trade #{trade_id} fully set up: {signal.direction} @ {signal.entry:.4f}, "
+                  f"size {rounded_size}, confidence {signal.confidence:.2f}. {tp_summary}")
 
 
 def _dry_run_check_fills(symbol: str, candles: list):
