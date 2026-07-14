@@ -96,6 +96,7 @@ DEFAULT_SETTINGS = {
     "live_mode_requested": "false",
     "dry_run": "false",
     "dry_run_starting_balance": "1000.0",
+    "leverage": "5",
 }
 
 

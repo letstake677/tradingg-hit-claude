@@ -97,6 +97,7 @@ class SettingsUpdate(BaseModel):
     timeframe: Optional[str] = None
     dry_run: Optional[bool] = None
     dry_run_starting_balance: Optional[float] = None
+    leverage: Optional[int] = None
 
 
 class ModeSwitchRequest(BaseModel):
@@ -130,6 +131,7 @@ def get_status():
             "timeframe": settings.get("timeframe", "15m"),
             "dry_run": settings.get("dry_run") == "true",
             "dry_run_starting_balance": float(settings.get("dry_run_starting_balance", 1000.0)),
+            "leverage": int(settings.get("leverage", 5)),
         },
         "open_position_count": len(db.get_open_trades(dry_run=settings.get("dry_run") == "true")),
     }
@@ -164,6 +166,8 @@ def update_settings(update: SettingsUpdate):
         db.log_event("info", "api", f"Dry run mode {'enabled' if update.dry_run else 'disabled'} via dashboard")
     if update.dry_run_starting_balance is not None:
         db.set_setting("dry_run_starting_balance", str(update.dry_run_starting_balance))
+    if update.leverage is not None:
+        db.set_setting("leverage", str(update.leverage))
     return {"settings": db.get_all_settings()}
 
 

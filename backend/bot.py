@@ -228,6 +228,14 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
     hold_side = "long" if signal.direction == "long" else "short"
     size_str = f"{rounded_size:.{volume_place}f}"
 
+    leverage = db.get_setting("leverage") or "5"
+    try:
+        client.set_leverage(symbol, leverage, product_type=PRODUCT_TYPE, hold_side=hold_side)
+    except BitgetAPIError as e:
+        _log("error", f"[{symbol}] could not set leverage to {leverage}x, skipping trade rather "
+                       f"than guessing what leverage is currently active: {e}")
+        return
+
     try:
         client.place_order(symbol=symbol, side=side, trade_side="open", order_type="market",
                             size=size_str, product_type=PRODUCT_TYPE)
