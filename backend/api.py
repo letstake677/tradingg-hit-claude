@@ -256,8 +256,11 @@ def open_trades():
             if symbol not in price_cache:
                 try:
                     raw = client.get_candles(symbol, "1m", product_type=product_type, limit=1)
-                    price_cache[symbol] = float(raw[-1][4])
-                except BitgetAPIError:
+                    price_cache[symbol] = float(raw[-1][4]) if raw else None
+                except Exception:
+                    # ANY failure here (API error, empty/malformed response,
+                    # etc.) should never take down the whole endpoint —
+                    # worst case this trade just shows no current_price.
                     price_cache[symbol] = None
             trade["current_price"] = price_cache[symbol]
     except ValueError:

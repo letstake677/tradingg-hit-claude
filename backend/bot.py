@@ -70,6 +70,16 @@ def _round_size(size: float, volume_place: int) -> float:
     factor = 10 ** int(volume_place)
     return math.floor(size * factor) / factor
 
+
+def _round_price(price: float, price_place: int) -> float:
+    """Nearest-rounds a trigger price to the symbol's required decimal
+    places. Same class of bug as size (error 40808), just for the price
+    parameter instead of the quantity — every symbol has a different
+    number of decimals Bitget will accept (e.g. ETHUSDT wants 2, DOGEUSDT
+    wants 5), and a flat f'{x:.6f}' was wrong for most of them."""
+    factor = 10 ** int(price_place)
+    return round(price * factor) / factor
+
 load_dotenv()
 
 POLL_INTERVAL_SECONDS = 60
@@ -208,6 +218,7 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
     try:
         config = _get_contract_config(client, symbol, PRODUCT_TYPE)
         volume_place = int(config.get("volumePlace", 6))
+        price_place = int(config.get("pricePlace", 6))
         min_trade_num = float(config.get("minTradeNum", 0) or 0)
         min_trade_usdt = float(config.get("minTradeUSDT", 0) or 0)
     except BitgetAPIError as e:
@@ -268,8 +279,9 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
                   f"{signal.entry:.4f}, size {rounded_size}). Placing SL/TP now.")
 
     try:
+        sl_price_str = f"{_round_price(plan.stop_loss, price_place):.{price_place}f}"
         sl_result = client.place_tpsl_leg(symbol=symbol, plan_type="loss_plan",
-                                           trigger_price=f"{plan.stop_loss:.6f}", hold_side=hold_side,
+                                           trigger_price=sl_price_str, hold_side=hold_side,
                                            size=size_str, product_type=PRODUCT_TYPE.lower())
         sl_order_id = sl_result.get("orderId") if isinstance(sl_result, dict) else None
         db.update_trade_sl(trade_id, new_stop_loss=plan.stop_loss, sl_order_id=sl_order_id)
@@ -292,8 +304,9 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
         leg_size = max(leg_size, 0.0)
         leg_size_str = f"{leg_size:.{volume_place}f}"
         try:
+            tp_price_str = f"{_round_price(tp.price, price_place):.{price_place}f}"
             tp_result = client.place_tpsl_leg(symbol=symbol, plan_type="profit_plan",
-                                               trigger_price=f"{tp.price:.6f}", hold_side=hold_side,
+                                               trigger_price=tp_price_str, hold_side=hold_side,
                                                size=leg_size_str, product_type=PRODUCT_TYPE.lower())
             order_id = tp_result.get("orderId") if isinstance(tp_result, dict) else None
             if order_id:
@@ -451,12 +464,14 @@ def manage_open_positions(client: BitgetClient):
                 try:
                     config = _get_contract_config(client, trade["symbol"], PRODUCT_TYPE)
                     volume_place = int(config.get("volumePlace", 6))
+                    price_place = int(config.get("pricePlace", 6))
                 except BitgetAPIError:
-                    volume_place = 6  # best-effort fallback — better than crashing this pass
+                    volume_place, price_place = 6, 6  # best-effort fallback — better than crashing this pass
                 sized_remaining = _round_size(live_size, volume_place)
+                breakeven_price = _round_price(trade["entry_price"], price_place)
                 new_sl = client.place_tpsl_leg(
                     symbol=trade["symbol"], plan_type="loss_plan",
-                    trigger_price=f"{trade['entry_price']:.6f}", hold_side=hold_side,
+                    trigger_price=f"{breakeven_price:.{price_place}f}", hold_side=hold_side,
                     size=f"{sized_remaining:.{volume_place}f}", product_type=PRODUCT_TYPE.lower(),
                 )
                 new_sl_order_id = new_sl.get("orderId") if isinstance(new_sl, dict) else None
