@@ -39,6 +39,7 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -89,8 +90,21 @@ PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
 
 
 def _start_of_today_ts() -> int:
-    now = datetime.now(timezone.utc)
-    return int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp())
+    """
+    Start of 'today' for the daily-loss circuit breaker, in TIMEZONE (set
+    via .env, defaults to UTC). Hardcoding UTC meant the day reset at
+    whatever hour UTC-midnight happens to fall in the user's own timezone
+    (e.g. 5am for UTC+5) instead of their actual midnight.
+    """
+    tz_name = os.getenv("TIMEZONE", "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        _log("warning", f"TIMEZONE='{tz_name}' not recognized, falling back to UTC. "
+                         f"Use a name like 'Asia/Karachi', not an offset like '+5'.")
+        tz = timezone.utc
+    now = datetime.now(tz)
+    return int(datetime(now.year, now.month, now.day, tzinfo=tz).timestamp())
 
 
 def load_credentials_for_mode(demo: bool) -> BitgetCredentials:
