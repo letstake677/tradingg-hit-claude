@@ -165,9 +165,23 @@ class SMCEngine:
 
     # ---------------- order blocks ----------------
 
-    def find_order_blocks(self, candles: list, events: list) -> list:
+    def find_order_blocks(self, candles: list, events: list, atr: Optional[float] = None,
+                           min_displacement_atr_mult: float = 0.5) -> list:
+        """
+        atr / min_displacement_atr_mult: filters out weak order blocks whose
+        breaking candle wasn't a genuine high-momentum displacement — just a
+        slow drift across the level. Real SMC order blocks come from candles
+        that actually IMPULSED through structure, not any candle that
+        happened to close past it. Pass atr=None to disable this filter
+        (e.g. when there isn't enough data yet to compute one).
+        """
         obs = []
         for idx, event in events:
+            if atr:
+                breaking_candle = candles[idx]
+                body = abs(breaking_candle.close - breaking_candle.open)
+                if body < atr * min_displacement_atr_mult:
+                    continue  # weak break — not real displacement, skip this order block
             if event in (StructureEvent.BOS_BULLISH, StructureEvent.CHOCH_BULLISH):
                 j = idx
                 while j > 0 and candles[j].close >= candles[j].open:
@@ -222,6 +236,36 @@ class SMCEngine:
                         "touches": len(cluster),
                     })
         return zones
+
+    # ---------------- liquidity sweep confirmation ----------------
+
+    def _detect_sweep(self, candles: list, liquidity: list, direction: str, lookback: int = 15) -> Optional[dict]:
+        """
+        A liquidity pool sitting near price isn't the same as it actually
+        being SWEPT. This checks the recent candles for a genuine sweep: a
+        wick that pushes THROUGH a known pool, followed by a close back on
+        the reversal side — the classic stop-hunt-then-reverse pattern.
+        Returns the swept zone dict if one is found, else None.
+        For a long: look for buy-side liquidity (equal lows) swept from
+        above (wick below it, close back above). For a short: sell-side
+        liquidity (equal highs) swept from below.
+        """
+        recent = candles[-lookback:] if len(candles) >= lookback else candles
+        if direction == "long":
+            for z in liquidity:
+                if z["kind"] != "buy_side":
+                    continue
+                for c in recent:
+                    if c.low < z["price"] < c.close:
+                        return z
+        else:
+            for z in liquidity:
+                if z["kind"] != "sell_side":
+                    continue
+                for c in recent:
+                    if c.high > z["price"] > c.close:
+                        return z
+        return None
 
     # ---------------- structure-based TP targets ----------------
 
@@ -334,14 +378,23 @@ class SMCEngine:
 
     # ---------------- signal generation ----------------
 
-    def generate_signal(self, candles: list) -> Optional[Signal]:
+    def generate_signal(self, candles: list, htf_trend: Optional["Trend"] = None) -> Optional[Signal]:
+        """
+        htf_trend: optional higher-timeframe trend (from running
+        detect_structure on a higher timeframe's candles). When given and
+        clearly BULLISH or BEARISH, signals against it are blocked — SMC
+        discipline is to trade WITH the bigger picture, not against it.
+        Leave as None (default) to skip this gate, e.g. when a higher
+        timeframe's candles aren't available yet.
+        """
         min_needed = self.swing_lookback * 2 + 10
         if len(candles) < min_needed:
             return None
 
         swings = self.find_swings(candles)
         trend, events = self.detect_structure(candles, swings)
-        order_blocks = self.find_order_blocks(candles, events)
+        atr = self._compute_atr(candles)
+        order_blocks = self.find_order_blocks(candles, events, atr=atr)
         fvgs = self.find_fvgs(candles)
         liquidity = self.find_liquidity_zones(swings)
 
@@ -355,10 +408,9 @@ class SMCEngine:
         bull_obs = [ob for ob in order_blocks if ob.kind == "bullish" and not ob.mitigated]
         bear_obs = [ob for ob in order_blocks if ob.kind == "bearish" and not ob.mitigated]
 
-        atr = self._compute_atr(candles)
         sl_reason = ""
 
-        if trend == Trend.BULLISH and bull_obs:
+        if trend == Trend.BULLISH and bull_obs and htf_trend != Trend.BEARISH:
             ob = bull_obs[-1]
             if ob.bottom <= last.low <= ob.top:
                 direction = "long"
@@ -368,11 +420,18 @@ class SMCEngine:
                 if any(f.kind == "bullish" and f.bottom <= last.low <= f.top for f in fvgs):
                     confidence += 0.2
                     reasons.append("Order block overlaps an unfilled bullish FVG")
-                if any(z["kind"] == "buy_side" for z in liquidity):
-                    confidence += 0.15
-                    reasons.append("Equal-lows liquidity pool nearby (possible sweep)")
+                swept = self._detect_sweep(candles, liquidity, "long")
+                if swept:
+                    confidence += 0.2
+                    reasons.append(f"Confirmed sweep of {swept['touches']} equal lows before reversal")
+                elif any(z["kind"] == "buy_side" for z in liquidity):
+                    confidence += 0.05
+                    reasons.append("Equal-lows liquidity pool nearby (not yet confirmed swept)")
+                if htf_trend == Trend.BULLISH:
+                    confidence += 0.1
+                    reasons.append("Aligned with bullish higher-timeframe trend")
 
-        elif trend == Trend.BEARISH and bear_obs:
+        elif trend == Trend.BEARISH and bear_obs and htf_trend != Trend.BULLISH:
             ob = bear_obs[-1]
             if ob.bottom <= last.high <= ob.top:
                 direction = "short"
@@ -382,9 +441,16 @@ class SMCEngine:
                 if any(f.kind == "bearish" and f.bottom <= last.high <= f.top for f in fvgs):
                     confidence += 0.2
                     reasons.append("Order block overlaps an unfilled bearish FVG")
-                if any(z["kind"] == "sell_side" for z in liquidity):
-                    confidence += 0.15
-                    reasons.append("Equal-highs liquidity pool nearby (possible sweep)")
+                swept = self._detect_sweep(candles, liquidity, "short")
+                if swept:
+                    confidence += 0.2
+                    reasons.append(f"Confirmed sweep of {swept['touches']} equal highs before reversal")
+                elif any(z["kind"] == "sell_side" for z in liquidity):
+                    confidence += 0.05
+                    reasons.append("Equal-highs liquidity pool nearby (not yet confirmed swept)")
+                if htf_trend == Trend.BEARISH:
+                    confidence += 0.1
+                    reasons.append("Aligned with bearish higher-timeframe trend")
 
         if direction is None:
             return None

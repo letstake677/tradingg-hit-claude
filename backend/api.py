@@ -98,6 +98,7 @@ class SettingsUpdate(BaseModel):
     dry_run: Optional[bool] = None
     dry_run_starting_balance: Optional[float] = None
     leverage: Optional[int] = None
+    session_filter_enabled: Optional[bool] = None
 
 
 class ModeSwitchRequest(BaseModel):
@@ -132,6 +133,7 @@ def get_status():
             "dry_run": settings.get("dry_run") == "true",
             "dry_run_starting_balance": float(settings.get("dry_run_starting_balance", 1000.0)),
             "leverage": int(settings.get("leverage", 5)),
+            "session_filter_enabled": settings.get("session_filter_enabled") == "true",
         },
         "open_position_count": len(db.get_open_trades(dry_run=settings.get("dry_run") == "true")),
     }
@@ -168,6 +170,8 @@ def update_settings(update: SettingsUpdate):
         db.set_setting("dry_run_starting_balance", str(update.dry_run_starting_balance))
     if update.leverage is not None:
         db.set_setting("leverage", str(update.leverage))
+    if update.session_filter_enabled is not None:
+        db.set_setting("session_filter_enabled", "true" if update.session_filter_enabled else "false")
     return {"settings": db.get_all_settings()}
 
 

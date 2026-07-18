@@ -44,7 +44,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 from bitget_client import BitgetClient, BitgetCredentials, BitgetAPIError
-from smc_engine import Candle, SMCEngine
+from smc_engine import Candle, SMCEngine, Trend
 from risk_manager import RiskManager
 import database as db
 import crypto_utils as cu
@@ -87,6 +87,31 @@ POLL_INTERVAL_SECONDS = 60
 MODE_CHECK_INTERVAL_SECONDS = 5
 GRANULARITY = os.getenv("TIMEFRAME", "15m")
 PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
+
+# Maps a trading timeframe to a sensible higher timeframe for bias
+# confirmation — SMC discipline is to read the bigger picture first, then
+# find precise entries on the lower timeframe. Handles both the casing
+# Bitget actually wants (4H, 1D — capitalized for hour+) and lowercase, in
+# case a setting is ever stored either way.
+HTF_MAP = {
+    "1m": "15m", "5m": "1H", "15m": "4H", "30m": "4H",
+    "1h": "4H", "1H": "4H", "4h": "1D", "4H": "1D", "1d": "1W", "1D": "1W",
+}
+
+# Well-known SMC "killzones" (UTC) — the London and New York session
+# opens, when institutional liquidity and manipulation moves are most
+# reliable. Crypto trades 24/7 unlike forex, so without a filter like this
+# the bot would treat 3am UTC the same as a session open.
+KILLZONES_UTC = [(7, 10), (12, 15)]  # (start_hour, end_hour), each UTC, end-exclusive
+
+
+def _higher_timeframe(tf: str) -> str:
+    return HTF_MAP.get(tf.strip(), "4H")
+
+
+def _in_killzone(ts_seconds: int) -> bool:
+    hour = datetime.fromtimestamp(ts_seconds, tz=timezone.utc).hour
+    return any(start <= hour < end for start, end in KILLZONES_UTC)
 
 
 def _start_of_today_ts() -> int:
@@ -172,7 +197,23 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
     if dry_run:
         _dry_run_check_fills(symbol, candles)
 
-    signal = engine.generate_signal(candles)
+    # Higher-timeframe bias: read the bigger picture before trusting a
+    # lower-timeframe setup. A failed fetch here shouldn't block the whole
+    # cycle — just proceed ungated (matches the old behaviour) and say why.
+    htf_trend = None
+    try:
+        htf = _higher_timeframe(GRANULARITY)
+        htf_raw = client.get_candles(symbol, htf, product_type=PRODUCT_TYPE, limit=150)
+        htf_candles = [Candle.from_bitget_row(row) for row in htf_raw]
+        if len(htf_candles) > 1 and htf_candles[0].ts > htf_candles[-1].ts:
+            htf_candles.reverse()
+        htf_swings = engine.find_swings(htf_candles)
+        htf_trend, _ = engine.detect_structure(htf_candles, htf_swings)
+    except BitgetAPIError as e:
+        _log("warning", f"[{symbol}] could not fetch higher-timeframe candles for bias "
+                         f"confirmation, proceeding without that gate this cycle: {e}")
+
+    signal = engine.generate_signal(candles, htf_trend=htf_trend)
     if signal is None:
         return
 
@@ -185,19 +226,54 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
         today_pnl_pct = (today_pnl / equity) * 100
 
     already_open_same_symbol = any(t["symbol"] == symbol for t in db.get_open_trades(symbol))
+
+    # Defense in depth: even if OUR database has no record of it (e.g. after
+    # a database reset from a redeploy without a properly persisted volume),
+    # NEVER open a duplicate position if Bitget itself already shows one
+    # open for this symbol. This is what actually stops double TP/SL orders
+    # stacking on top of an existing position, regardless of why the
+    # database and Bitget got out of sync in the first place.
+    if not dry_run and not already_open_same_symbol:
+        try:
+            live_positions = client.get_positions(product_type=PRODUCT_TYPE)
+            live_size = next((float(p.get("total", 0)) for p in live_positions
+                               if p.get("symbol") == symbol), 0.0)
+            if live_size > 0:
+                already_open_same_symbol = True
+                _log("warning", f"[{symbol}] Bitget already shows an open position here that our "
+                                 f"database has no record of (likely a database reset from a "
+                                 f"redeploy) — refusing to open a duplicate. Check this position "
+                                 f"manually on Bitget; its SL/TP may need setting/verifying by "
+                                 f"hand since the bot has no memory of what it originally planned.")
+        except BitgetAPIError as e:
+            _log("error", f"[{symbol}] could not verify existing Bitget positions before opening "
+                           f"a new trade, skipping this cycle to be safe: {e}")
+            return
+
     can_open = risk_mgr.can_open_new_position(
         open_position_count=len(db.get_open_trades()),
         today_realised_pnl_pct=today_pnl_pct,
     )
+    # A/N: crypto trades 24/7, but SMC "killzones" (session opens) are where
+    # institutional liquidity moves are most reliable — outside them, the
+    # same structure is less trustworthy. Toggleable since not everyone
+    # wants this restriction.
+    session_ok = True
+    if db.get_setting("session_filter_enabled") == "true":
+        session_ok = _in_killzone(candles[-1].ts)
+
     # A structural SL alone isn't "educated" enough — if every TP fell back to
     # a raw R-multiple, there's no real target to trade toward, just a guess
     # on the reward side. Skip it rather than betting on made-up levels.
-    taken = can_open and not already_open_same_symbol and signal.has_real_tp_structure
+    taken = can_open and not already_open_same_symbol and signal.has_real_tp_structure and session_ok
     db.log_signal(symbol, signal, taken=taken)
     if not taken:
         if not signal.has_real_tp_structure:
             _log("info", f"[{symbol}] signal skipped — no real TP structure found (every "
                           f"target was a raw R-multiple guess), not a real setup to trade")
+        elif not session_ok:
+            _log("info", f"[{symbol}] signal skipped — outside the London/New York killzones "
+                          f"(session filter is on in Settings)")
         elif not can_open and today_pnl_pct <= -abs(risk_mgr.max_daily_loss_pct):
             _log("warning", f"[{symbol}] signal skipped — daily loss circuit breaker tripped "
                              f"({today_pnl_pct:.2f}% today)")

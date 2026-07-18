@@ -97,6 +97,7 @@ DEFAULT_SETTINGS = {
     "dry_run": "false",
     "dry_run_starting_balance": "1000.0",
     "leverage": "5",
+    "session_filter_enabled": "true",
 }
 
 
