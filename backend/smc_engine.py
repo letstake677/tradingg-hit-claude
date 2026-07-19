@@ -378,14 +378,27 @@ class SMCEngine:
 
     # ---------------- signal generation ----------------
 
-    def generate_signal(self, candles: list, htf_trend: Optional["Trend"] = None) -> Optional[Signal]:
+    def generate_signal(self, candles: list, htf_trend: Optional["Trend"] = None,
+                         htf_bias_enabled: bool = True, require_sweep_confirmation: bool = True,
+                         displacement_filter_enabled: bool = True) -> Optional[Signal]:
         """
         htf_trend: optional higher-timeframe trend (from running
-        detect_structure on a higher timeframe's candles). When given and
-        clearly BULLISH or BEARISH, signals against it are blocked — SMC
-        discipline is to trade WITH the bigger picture, not against it.
-        Leave as None (default) to skip this gate, e.g. when a higher
-        timeframe's candles aren't available yet.
+        detect_structure on a higher timeframe's candles).
+
+        htf_bias_enabled: when True (default) and htf_trend is clearly
+        BULLISH/BEARISH, signals fighting it are blocked. Set False to
+        ignore htf_trend entirely (equivalent to not passing it at all).
+
+        require_sweep_confirmation: when True (default), a liquidity pool
+        merely sitting nearby only earns a small confidence nod — the full
+        boost needs an actually-confirmed sweep. Set False to restore the
+        looser behaviour where proximity alone counts almost as much as a
+        confirmed sweep.
+
+        displacement_filter_enabled: when True (default), order blocks
+        formed by a weak/low-momentum break are excluded. Set False to
+        accept any structural break regardless of the breaking candle's
+        strength.
         """
         min_needed = self.swing_lookback * 2 + 10
         if len(candles) < min_needed:
@@ -394,9 +407,11 @@ class SMCEngine:
         swings = self.find_swings(candles)
         trend, events = self.detect_structure(candles, swings)
         atr = self._compute_atr(candles)
-        order_blocks = self.find_order_blocks(candles, events, atr=atr)
+        order_blocks = self.find_order_blocks(candles, events,
+                                               atr=(atr if displacement_filter_enabled else None))
         fvgs = self.find_fvgs(candles)
         liquidity = self.find_liquidity_zones(swings)
+        effective_htf_trend = htf_trend if htf_bias_enabled else None
 
         last = candles[-1]
         reasons = []
@@ -410,7 +425,7 @@ class SMCEngine:
 
         sl_reason = ""
 
-        if trend == Trend.BULLISH and bull_obs and htf_trend != Trend.BEARISH:
+        if trend == Trend.BULLISH and bull_obs and effective_htf_trend != Trend.BEARISH:
             ob = bull_obs[-1]
             if ob.bottom <= last.low <= ob.top:
                 direction = "long"
@@ -425,13 +440,14 @@ class SMCEngine:
                     confidence += 0.2
                     reasons.append(f"Confirmed sweep of {swept['touches']} equal lows before reversal")
                 elif any(z["kind"] == "buy_side" for z in liquidity):
-                    confidence += 0.05
-                    reasons.append("Equal-lows liquidity pool nearby (not yet confirmed swept)")
-                if htf_trend == Trend.BULLISH:
+                    confidence += 0.05 if require_sweep_confirmation else 0.15
+                    reasons.append("Equal-lows liquidity pool nearby"
+                                   + (" (not yet confirmed swept)" if require_sweep_confirmation else " (possible sweep)"))
+                if effective_htf_trend == Trend.BULLISH:
                     confidence += 0.1
                     reasons.append("Aligned with bullish higher-timeframe trend")
 
-        elif trend == Trend.BEARISH and bear_obs and htf_trend != Trend.BULLISH:
+        elif trend == Trend.BEARISH and bear_obs and effective_htf_trend != Trend.BULLISH:
             ob = bear_obs[-1]
             if ob.bottom <= last.high <= ob.top:
                 direction = "short"
@@ -446,8 +462,9 @@ class SMCEngine:
                     confidence += 0.2
                     reasons.append(f"Confirmed sweep of {swept['touches']} equal highs before reversal")
                 elif any(z["kind"] == "sell_side" for z in liquidity):
-                    confidence += 0.05
-                    reasons.append("Equal-highs liquidity pool nearby (not yet confirmed swept)")
+                    confidence += 0.05 if require_sweep_confirmation else 0.15
+                    reasons.append("Equal-highs liquidity pool nearby"
+                                   + (" (not yet confirmed swept)" if require_sweep_confirmation else " (possible sweep)"))
                 if htf_trend == Trend.BEARISH:
                     confidence += 0.1
                     reasons.append("Aligned with bearish higher-timeframe trend")

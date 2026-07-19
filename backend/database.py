@@ -98,6 +98,9 @@ DEFAULT_SETTINGS = {
     "dry_run_starting_balance": "1000.0",
     "leverage": "5",
     "session_filter_enabled": "true",
+    "htf_bias_enabled": "true",
+    "require_sweep_confirmation": "true",
+    "displacement_filter_enabled": "true",
 }
 
 

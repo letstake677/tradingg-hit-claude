@@ -99,6 +99,9 @@ class SettingsUpdate(BaseModel):
     dry_run_starting_balance: Optional[float] = None
     leverage: Optional[int] = None
     session_filter_enabled: Optional[bool] = None
+    htf_bias_enabled: Optional[bool] = None
+    require_sweep_confirmation: Optional[bool] = None
+    displacement_filter_enabled: Optional[bool] = None
 
 
 class ModeSwitchRequest(BaseModel):
@@ -134,6 +137,9 @@ def get_status():
             "dry_run_starting_balance": float(settings.get("dry_run_starting_balance", 1000.0)),
             "leverage": int(settings.get("leverage", 5)),
             "session_filter_enabled": settings.get("session_filter_enabled") == "true",
+            "htf_bias_enabled": settings.get("htf_bias_enabled") == "true",
+            "require_sweep_confirmation": settings.get("require_sweep_confirmation") == "true",
+            "displacement_filter_enabled": settings.get("displacement_filter_enabled") == "true",
         },
         "open_position_count": len(db.get_open_trades(dry_run=settings.get("dry_run") == "true")),
     }
@@ -172,6 +178,12 @@ def update_settings(update: SettingsUpdate):
         db.set_setting("leverage", str(update.leverage))
     if update.session_filter_enabled is not None:
         db.set_setting("session_filter_enabled", "true" if update.session_filter_enabled else "false")
+    if update.htf_bias_enabled is not None:
+        db.set_setting("htf_bias_enabled", "true" if update.htf_bias_enabled else "false")
+    if update.require_sweep_confirmation is not None:
+        db.set_setting("require_sweep_confirmation", "true" if update.require_sweep_confirmation else "false")
+    if update.displacement_filter_enabled is not None:
+        db.set_setting("displacement_filter_enabled", "true" if update.displacement_filter_enabled else "false")
     return {"settings": db.get_all_settings()}
 
 

@@ -200,20 +200,29 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
     # Higher-timeframe bias: read the bigger picture before trusting a
     # lower-timeframe setup. A failed fetch here shouldn't block the whole
     # cycle — just proceed ungated (matches the old behaviour) and say why.
-    htf_trend = None
-    try:
-        htf = _higher_timeframe(GRANULARITY)
-        htf_raw = client.get_candles(symbol, htf, product_type=PRODUCT_TYPE, limit=150)
-        htf_candles = [Candle.from_bitget_row(row) for row in htf_raw]
-        if len(htf_candles) > 1 and htf_candles[0].ts > htf_candles[-1].ts:
-            htf_candles.reverse()
-        htf_swings = engine.find_swings(htf_candles)
-        htf_trend, _ = engine.detect_structure(htf_candles, htf_swings)
-    except BitgetAPIError as e:
-        _log("warning", f"[{symbol}] could not fetch higher-timeframe candles for bias "
-                         f"confirmation, proceeding without that gate this cycle: {e}")
+    htf_bias_enabled = db.get_setting("htf_bias_enabled") == "true"
+    require_sweep_confirmation = db.get_setting("require_sweep_confirmation") == "true"
+    displacement_filter_enabled = db.get_setting("displacement_filter_enabled") == "true"
 
-    signal = engine.generate_signal(candles, htf_trend=htf_trend)
+    htf_trend = None
+    if htf_bias_enabled:
+        try:
+            htf = _higher_timeframe(GRANULARITY)
+            htf_raw = client.get_candles(symbol, htf, product_type=PRODUCT_TYPE, limit=150)
+            htf_candles = [Candle.from_bitget_row(row) for row in htf_raw]
+            if len(htf_candles) > 1 and htf_candles[0].ts > htf_candles[-1].ts:
+                htf_candles.reverse()
+            htf_swings = engine.find_swings(htf_candles)
+            htf_trend, _ = engine.detect_structure(htf_candles, htf_swings)
+        except BitgetAPIError as e:
+            _log("warning", f"[{symbol}] could not fetch higher-timeframe candles for bias "
+                             f"confirmation, proceeding without that gate this cycle: {e}")
+
+    signal = engine.generate_signal(
+        candles, htf_trend=htf_trend, htf_bias_enabled=htf_bias_enabled,
+        require_sweep_confirmation=require_sweep_confirmation,
+        displacement_filter_enabled=displacement_filter_enabled,
+    )
     if signal is None:
         return
 
