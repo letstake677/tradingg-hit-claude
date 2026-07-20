@@ -57,6 +57,13 @@ import crypto_utils as cu
 # sending the wrong precision for most symbols.
 _contract_config_cache = {}
 
+# Per-symbol higher-timeframe trend cache: (trend, cached_at_unix_ts). A 4H/1D
+# trend barely moves minute to minute, so re-fetching it every 60s tick for
+# every symbol was pure waste — with ~20 symbols each needing 2 candle
+# calls per tick, that's what tripped Bitget's rate limit (429).
+_htf_trend_cache = {}
+HTF_CACHE_SECONDS = 900  # 15 minutes
+
 
 def _get_contract_config(client: BitgetClient, symbol: str, product_type: str) -> dict:
     key = (symbol, product_type)
@@ -206,17 +213,24 @@ def process_symbol(client: BitgetClient, engine: SMCEngine, risk_mgr: RiskManage
 
     htf_trend = None
     if htf_bias_enabled:
-        try:
-            htf = _higher_timeframe(GRANULARITY)
-            htf_raw = client.get_candles(symbol, htf, product_type=PRODUCT_TYPE, limit=150)
-            htf_candles = [Candle.from_bitget_row(row) for row in htf_raw]
-            if len(htf_candles) > 1 and htf_candles[0].ts > htf_candles[-1].ts:
-                htf_candles.reverse()
-            htf_swings = engine.find_swings(htf_candles)
-            htf_trend, _ = engine.detect_structure(htf_candles, htf_swings)
-        except BitgetAPIError as e:
-            _log("warning", f"[{symbol}] could not fetch higher-timeframe candles for bias "
-                             f"confirmation, proceeding without that gate this cycle: {e}")
+        cached = _htf_trend_cache.get(symbol)
+        if cached and (time.time() - cached[1]) < HTF_CACHE_SECONDS:
+            htf_trend = cached[0]
+        else:
+            try:
+                htf = _higher_timeframe(GRANULARITY)
+                htf_raw = client.get_candles(symbol, htf, product_type=PRODUCT_TYPE, limit=150)
+                htf_candles = [Candle.from_bitget_row(row) for row in htf_raw]
+                if len(htf_candles) > 1 and htf_candles[0].ts > htf_candles[-1].ts:
+                    htf_candles.reverse()
+                htf_swings = engine.find_swings(htf_candles)
+                htf_trend, _ = engine.detect_structure(htf_candles, htf_swings)
+                _htf_trend_cache[symbol] = (htf_trend, time.time())
+            except BitgetAPIError as e:
+                _log("warning", f"[{symbol}] could not fetch higher-timeframe candles for bias "
+                                 f"confirmation, proceeding without that gate this cycle: {e}")
+                if cached:
+                    htf_trend = cached[0]  # stale is still better than nothing if the fetch failed
 
     signal = engine.generate_signal(
         candles, htf_trend=htf_trend, htf_bias_enabled=htf_bias_enabled,
@@ -717,6 +731,14 @@ def main():
         dry_run = settings.get("dry_run", "false") == "true"
 
         for symbol in symbols:
+            # Re-check every symbol, not just once at the top of this tick —
+            # otherwise clicking Stop mid-cycle had no effect until the
+            # ENTIRE symbol batch finished (could be 20+ symbols, each with
+            # 2 candle fetches), which could take a while and meant a
+            # freshly-started trade after "Stop" was pressed.
+            if db.get_setting("bot_running") != "true":
+                _log("info", "Bot was stopped mid-cycle — halting symbol processing immediately.")
+                break
             if symbol in invalid_symbols:
                 continue  # already confirmed invalid this run — don't keep hammering it
             try:
@@ -731,6 +753,7 @@ def main():
                     _log("error", f"[{symbol}] Bitget API error: {e}")
             except Exception:
                 _log("error", f"[{symbol}] unexpected error:\n{traceback.format_exc()}")
+            time.sleep(0.3)  # small gap between symbols to ease rate-limit pressure
 
         # In dry run, nothing was ever sent to Bitget, so there's nothing
         # real to reconcile — skip these entirely rather than making
