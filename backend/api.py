@@ -379,7 +379,37 @@ def stats():
     return db.get_stats(dry_run=is_dry_run)
 
 
-@app.get("/api/account/balance")
+@app.post("/api/sync")
+def sync_with_bitget():
+    """
+    Runs manage_open_positions + reconcile_open_trades immediately, on
+    demand — for stuck positions that should have been closed already, or
+    just to force a check without waiting for the next ~60s bot cycle.
+    Works even if the bot is currently stopped.
+    """
+    if db.get_setting("dry_run") == "true":
+        return JSONResponse(status_code=400, content={
+            "error": "Dry run positions are managed automatically each cycle, nothing to sync "
+                     "against a real Bitget account right now."})
+    demo = db.get_setting("live_mode_active") != "true"
+    try:
+        creds = bot_module.load_credentials_for_mode(demo)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    client = BitgetClient(creds)
+    before = len(db.get_open_trades(dry_run=False))
+    try:
+        bot_module.manage_open_positions(client)
+    except Exception as e:
+        db.log_event("error", "api", f"manual sync: manage_open_positions failed: {e}")
+    try:
+        bot_module.reconcile_open_trades(client)
+    except Exception as e:
+        db.log_event("error", "api", f"manual sync: reconcile_open_trades failed: {e}")
+    after = len(db.get_open_trades(dry_run=False))
+    db.log_event("info", "api", f"Manual sync with Bitget completed via dashboard "
+                                 f"({before} open trades before, {after} after)")
+    return {"synced": True, "open_before": before, "open_after": after}
 def account_balance():
     """
     Live USDT equity straight from Bitget, for whichever mode bot.py has

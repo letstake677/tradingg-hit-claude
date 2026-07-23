@@ -550,53 +550,63 @@ def manage_open_positions(client: BitgetClient):
         if live is None:
             continue  # fully closed — reconcile_open_trades() handles this case
 
-        original_size = trade["position_size"]
-        if original_size <= 0:
-            continue
-        live_size = float(live.get("total", 0))
-        filled_fraction = max(0.0, min(1.0, 1 - (live_size / original_size)))
+        try:
+            _manage_one_position(client, trade, live)
+        except Exception:
+            # One trade blowing up here must NEVER stop TP-hit detection and
+            # breakeven moves for every other open trade in this same pass.
+            _log("error", f"[{trade['symbol']}] trade #{trade['id']}: manage_open_positions crashed, "
+                           f"will retry next cycle:\n{traceback.format_exc()}")
 
-        legs = sorted(trade["tp_legs"], key=lambda l: l["level"])
-        cumulative = 0.0
-        for leg in legs:
-            cumulative += leg["close_fraction"]
-            # small tolerance for fees/rounding — live size is rarely an
-            # exact fraction of the original
-            if leg["hit"] != 1 and filled_fraction >= cumulative - 0.03:
-                db.mark_tp_hit(trade["id"], leg["level"])
-                leg["hit"] = 1
-                _log("info", f"[{trade['symbol']}] trade #{trade['id']} TP{leg['level']} appears "
-                              f"filled (~{filled_fraction*100:.0f}% of position closed)")
 
-        tp1 = next((l for l in legs if l["level"] == 1), None)
-        if tp1 and tp1["hit"] == 1 and not trade["breakeven_applied"]:
-            hold_side = "long" if trade["direction"] == "long" else "short"
+def _manage_one_position(client: BitgetClient, trade: dict, live: dict):
+    original_size = trade["position_size"]
+    if original_size <= 0:
+        return
+    live_size = float(live.get("total", 0))
+    filled_fraction = max(0.0, min(1.0, 1 - (live_size / original_size)))
+
+    legs = sorted(trade["tp_legs"], key=lambda l: l["level"])
+    cumulative = 0.0
+    for leg in legs:
+        cumulative += leg["close_fraction"]
+        # small tolerance for fees/rounding — live size is rarely an
+        # exact fraction of the original
+        if leg["hit"] != 1 and filled_fraction >= cumulative - 0.03:
+            db.mark_tp_hit(trade["id"], leg["level"])
+            leg["hit"] = 1
+            _log("info", f"[{trade['symbol']}] trade #{trade['id']} TP{leg['level']} appears "
+                          f"filled (~{filled_fraction*100:.0f}% of position closed)")
+
+    tp1 = next((l for l in legs if l["level"] == 1), None)
+    if tp1 and tp1["hit"] == 1 and not trade["breakeven_applied"]:
+        hold_side = "long" if trade["direction"] == "long" else "short"
+        try:
+            if trade.get("sl_order_id"):
+                client.cancel_tpsl_order(trade["symbol"], trade["sl_order_id"], product_type=PRODUCT_TYPE)
             try:
-                if trade.get("sl_order_id"):
-                    client.cancel_tpsl_order(trade["symbol"], trade["sl_order_id"], product_type=PRODUCT_TYPE)
-                try:
-                    config = _get_contract_config(client, trade["symbol"], PRODUCT_TYPE)
-                    volume_place = int(config.get("volumePlace", 6))
-                    price_place = int(config.get("pricePlace", 6))
-                except BitgetAPIError:
-                    volume_place, price_place = 6, 6  # best-effort fallback — better than crashing this pass
-                sized_remaining = _round_size(live_size, volume_place)
-                breakeven_price = _round_price(trade["entry_price"], price_place)
-                new_sl = client.place_tpsl_leg(
-                    symbol=trade["symbol"], plan_type="loss_plan",
-                    trigger_price=f"{breakeven_price:.{price_place}f}", hold_side=hold_side,
-                    size=f"{sized_remaining:.{volume_place}f}", product_type=PRODUCT_TYPE.lower(),
-                )
-                new_sl_order_id = new_sl.get("orderId") if isinstance(new_sl, dict) else None
-                db.update_trade_sl(trade["id"], new_stop_loss=trade["entry_price"],
-                                    sl_order_id=new_sl_order_id,
-                                    sl_reason="moved to breakeven after TP1 filled",
-                                    breakeven_applied=True)
-                _log("info", f"[{trade['symbol']}] trade #{trade['id']} SL moved to breakeven "
-                              f"({trade['entry_price']:.4f}) after TP1")
-            except BitgetAPIError as e:
-                _log("error", f"[{trade['symbol']}] trade #{trade['id']} failed to move SL to "
-                               f"breakeven: {e}")
+                config = _get_contract_config(client, trade["symbol"], PRODUCT_TYPE)
+                volume_place = int(config.get("volumePlace", 6))
+                price_place = int(config.get("pricePlace", 6))
+            except BitgetAPIError:
+                volume_place, price_place = 6, 6  # best-effort fallback — better than crashing this pass
+            sized_remaining = _round_size(live_size, volume_place)
+            breakeven_price = _round_price(trade["entry_price"], price_place)
+            new_sl = client.place_tpsl_leg(
+                symbol=trade["symbol"], plan_type="loss_plan",
+                trigger_price=f"{breakeven_price:.{price_place}f}", hold_side=hold_side,
+                size=f"{sized_remaining:.{volume_place}f}", product_type=PRODUCT_TYPE.lower(),
+            )
+            new_sl_order_id = new_sl.get("orderId") if isinstance(new_sl, dict) else None
+            db.update_trade_sl(trade["id"], new_stop_loss=trade["entry_price"],
+                                sl_order_id=new_sl_order_id,
+                                sl_reason="moved to breakeven after TP1 filled",
+                                breakeven_applied=True)
+            _log("info", f"[{trade['symbol']}] trade #{trade['id']} SL moved to breakeven "
+                          f"({trade['entry_price']:.4f}) after TP1")
+        except BitgetAPIError as e:
+            _log("error", f"[{trade['symbol']}] trade #{trade['id']} failed to move SL to "
+                           f"breakeven: {e}")
 
 
 def reconcile_open_trades(client: BitgetClient):
@@ -621,36 +631,48 @@ def reconcile_open_trades(client: BitgetClient):
         if trade["symbol"] in live_symbols:
             continue
 
-        pnl = 0.0
         try:
-            history = client.get_history_positions(symbol=trade["symbol"], product_type=PRODUCT_TYPE, limit=10)
-            # best-effort match: same symbol, opened near the price we recorded,
-            # and closed at/after we opened our side of it
-            match = next(
-                (h for h in history if
-                 abs(float(h.get("openAvgPrice", 0)) - trade["entry_price"]) / max(trade["entry_price"], 1e-9) < 0.01
-                 and int(h.get("ctime", 0)) >= trade["opened_at"] * 1000 - 5000),
-                None,
-            )
-            if match:
-                pnl = float(match.get("netProfit", 0))
-            else:
-                _log("warning", f"[{trade['symbol']}] trade #{trade['id']} closed but no matching "
-                                 f"history-position record found — pnl recorded as 0.0, verify on Bitget")
-        except BitgetAPIError as e:
-            _log("error", f"[{trade['symbol']}] could not fetch history-position for trade "
-                           f"#{trade['id']}: {e}")
+            _reconcile_one_trade(client, trade)
+        except Exception:
+            # One trade's reconciliation blowing up must NEVER stop the
+            # other open trades in this same pass from being checked —
+            # otherwise a single bad case blocks reconciliation for
+            # everything else every single cycle.
+            _log("error", f"[{trade['symbol']}] trade #{trade['id']}: reconciliation crashed, "
+                           f"will retry next cycle:\n{traceback.format_exc()}")
 
-        all_tp_hit = bool(trade["tp_legs"]) and all(leg["hit"] == 1 for leg in trade["tp_legs"])
-        if all_tp_hit:
-            close_reason = "tp_all_hit"
-        elif trade["breakeven_applied"]:
-            close_reason = "breakeven"
+
+def _reconcile_one_trade(client: BitgetClient, trade: dict):
+    pnl = 0.0
+    try:
+        history = client.get_history_positions(symbol=trade["symbol"], product_type=PRODUCT_TYPE, limit=10)
+        # best-effort match: same symbol, opened near the price we recorded,
+        # and closed at/after we opened our side of it
+        match = next(
+            (h for h in history if
+             abs(float(h.get("openAvgPrice", 0)) - trade["entry_price"]) / max(trade["entry_price"], 1e-9) < 0.01
+             and int(h.get("ctime", 0)) >= trade["opened_at"] * 1000 - 5000),
+            None,
+        )
+        if match:
+            pnl = float(match.get("netProfit", 0))
         else:
-            close_reason = "sl_hit"
+            _log("warning", f"[{trade['symbol']}] trade #{trade['id']} closed but no matching "
+                             f"history-position record found — pnl recorded as 0.0, verify on Bitget")
+    except BitgetAPIError as e:
+        _log("error", f"[{trade['symbol']}] could not fetch history-position for trade "
+                       f"#{trade['id']}: {e}")
 
-        db.close_trade(trade["id"], realized_pnl=pnl, close_reason=close_reason)
-        _log("info", f"[{trade['symbol']}] trade #{trade['id']} closed — pnl {pnl:.4f}, reason {close_reason}")
+    all_tp_hit = bool(trade["tp_legs"]) and all(leg["hit"] == 1 for leg in trade["tp_legs"])
+    if all_tp_hit:
+        close_reason = "tp_all_hit"
+    elif trade["breakeven_applied"]:
+        close_reason = "breakeven"
+    else:
+        close_reason = "sl_hit"
+
+    db.close_trade(trade["id"], realized_pnl=pnl, close_reason=close_reason)
+    _log("info", f"[{trade['symbol']}] trade #{trade['id']} closed — pnl {pnl:.4f}, reason {close_reason}")
 
 
 def main():
